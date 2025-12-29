@@ -2290,7 +2290,7 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 [[package]]
 name = "rack"
 version = "0.4.8"
-source = "git+https://github.com/lzj15/rack.git?branch=patch-1#c0e30b44f0d9a0c698fa6a84d231c6386b33fb80"
+source = "git+https://github.com/lzj15/rack.git#c0e30b44f0d9a0c698fa6a84d231c6386b33fb80"
 dependencies = [
  "cmake",
  "smallvec",

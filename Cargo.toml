@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 iced = "0.14.0"
 jack = "0.13.3"
-rack = { git = "https://github.com/lzj15/rack.git", branch = "patch-1" }
+rack = { git = "https://github.com/lzj15/rack.git" }
 ringbuf = "0.4.8"

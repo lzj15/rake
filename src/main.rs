@@ -1,5 +1,5 @@
-use iced::Element;
-use iced::widget::{button, column, pick_list, slider, text};
+use iced::widget::{Column, button, column, pick_list, row, scrollable, slider, text};
+use iced::{Element, Length};
 use jack::{AudioIn, AudioOut, Client, ClientOptions, ProcessHandler};
 use rack::prelude::*;
 use ringbuf::traits::{Consumer, Producer, Split};
@@ -9,12 +9,17 @@ fn main() -> iced::Result {
     iced::application(boot, update, view).run()
 }
 
+struct LoadedPlugin {
+    id: usize,
+    info: PluginInfo,
+    params: Vec<(ParameterInfo, f32)>,
+}
+
 #[derive(Default)]
 struct AppState {
     plugin_scanner: Option<Scanner>,
     scanned_plugins: Vec<PluginInfo>,
-    // Plugin's info and its id
-    loaded_plugins: Vec<(PluginInfo, usize)>,
+    loaded_plugins: Vec<LoadedPlugin>,
     // An unique id for each plugin loaded
     plugin_id: usize,
     volume: f32,
@@ -27,13 +32,13 @@ enum Message {
     Scan,
     LoadPlugin(usize),
     DeletePlugin(usize),
+    ParamChange(usize, usize, f32),
     VolumeChange(f32),
 }
 
 fn update(state: &mut AppState, message: Message) {
     match message {
         Message::Scan => {
-            state.plugin_scanner = Some(Scanner::new().expect("Failed to create plugin scanner"));
             state.scanned_plugins = state
                 .plugin_scanner
                 .as_ref()
@@ -42,24 +47,37 @@ fn update(state: &mut AppState, message: Message) {
                 .expect("Failed to scan plugins");
         }
         Message::LoadPlugin(index) => {
-            state
-                .loaded_plugins
-                .push((state.scanned_plugins[index].clone(), state.plugin_id));
-
-            let mut plugin = state
+            let mut plugin_instance = state
                 .plugin_scanner
                 .as_ref()
-                .expect("Empty scanner")
+                .unwrap()
                 .load(&state.scanned_plugins[index])
-                .expect("Load fail");
+                .expect("Failed to load plugin");
 
-            plugin.initialize(48000.0, 2048).unwrap();
+            plugin_instance
+                .initialize(48000.0, 2048)
+                .expect("Failed to initialize plugin");
+
+            let mut params = Vec::with_capacity(plugin_instance.parameter_count());
+            for index in 0..plugin_instance.parameter_count() {
+                params.push((
+                    plugin_instance.parameter_info(index).unwrap(),
+                    plugin_instance.get_parameter(index).unwrap(),
+                ));
+            }
+
+            let plugin = LoadedPlugin {
+                id: state.plugin_id,
+                info: state.scanned_plugins[index].clone(),
+                params,
+            };
+            state.loaded_plugins.push(plugin);
 
             if state
                 .command_sender
                 .as_mut()
-                .expect("empty sender")
-                .try_push(Command::Load(plugin, state.plugin_id))
+                .unwrap()
+                .try_push(Command::Load(plugin_instance, state.plugin_id))
                 .is_err()
             {
                 println!("Failed to send command");
@@ -68,16 +86,28 @@ fn update(state: &mut AppState, message: Message) {
             state.plugin_id += 1;
         }
         Message::DeletePlugin(id) => {
-            for index in 0..state.loaded_plugins.len() {
-                if state.loaded_plugins[index].1 == id {
-                    state.loaded_plugins.remove(index);
+            state.loaded_plugins.retain(|plugin| plugin.id != id);
+            if state
+                .command_sender
+                .as_mut()
+                .unwrap()
+                .try_push(Command::Delete(id))
+                .is_err()
+            {
+                println!("Failed to send command");
+            }
+        }
+        Message::ParamChange(plugin_id, param_index, value) => {
+            for plugin in &mut state.loaded_plugins {
+                if plugin.id == plugin_id {
+                    plugin.params[param_index].1 = value
                 }
             }
             if state
                 .command_sender
                 .as_mut()
-                .expect("empty sender")
-                .try_push(Command::Delete(id))
+                .unwrap()
+                .try_push(Command::ParamChange(plugin_id, param_index, value))
                 .is_err()
             {
                 println!("Failed to send command");
@@ -88,7 +118,7 @@ fn update(state: &mut AppState, message: Message) {
             if state
                 .command_sender
                 .as_mut()
-                .expect("empty sender")
+                .unwrap()
                 .try_push(Command::VolumeChange(volume))
                 .is_err()
             {
@@ -99,36 +129,55 @@ fn update(state: &mut AppState, message: Message) {
 }
 
 fn view(state: &AppState) -> Element<'_, Message> {
-    column![
-        button("Scan").on_press(Message::Scan),
-        text(format!("Scanned plugins:\n\n{:?}\n", state.scanned_plugins)),
-        text("Pick a plugin to load"),
+    let mut scanned_plugins_list: Column<'_, Message> = Column::new();
+    for info in &state.scanned_plugins {
+        scanned_plugins_list = scanned_plugins_list.push(text(format!("{}", info)));
+    }
+
+    let mut plugin_list: Column<'_, Message> = Column::new();
+    for plugin in &state.loaded_plugins {
+        plugin_list = plugin_list.push(text(plugin.info.name.clone()));
+
+        for param in &plugin.params {
+            plugin_list = plugin_list.push(row![
+                text(param.0.name.clone()).width(Length::Fixed(100.0)),
+                text(format!("{:.2} ", param.1)),
+                slider(0.0..=1.0, param.1, |value| {
+                    // TODO: denormalize parameter value
+                    // For VST3, it seems that min/max in ParameterInfo always gives 0.0 and 1.0
+                    // so currently there's no way to denormalize parameter value
+                    Message::ParamChange(plugin.id, param.0.index, value)
+                })
+                .step(0.01),
+            ]);
+        }
+        plugin_list = plugin_list.push(button("Delete").on_press(Message::DeletePlugin(plugin.id)));
+    }
+
+    scrollable(column![
+        button("Rescan").on_press(Message::Scan),
+        scrollable(scanned_plugins_list),
+        text("\nPick a plugin to load"),
         pick_list(
             Vec::from_iter(0..state.scanned_plugins.len()),
             None::<usize>,
             Message::LoadPlugin
         ),
-        text(format!("Loaded plugins:\n\n{:?}\n", state.loaded_plugins)),
-        text("Pick a plugin to delete"),
-        pick_list(
-            state
-                .loaded_plugins
-                .iter()
-                .map(|&(_, id)| id)
-                .collect::<Vec<usize>>(),
-            // Vec::from_iter(0..state.loaded_plugins.len()),
-            None::<usize>,
-            Message::DeletePlugin
-        ),
-        text(format!("Volume:{:?}", state.volume)),
-        slider(0.0..=15.0, state.volume, Message::VolumeChange),
-    ]
+        plugin_list,
+        row![
+            text(format!("Volume: {:?} ", state.volume)),
+            slider(0.0..=15.0, state.volume, Message::VolumeChange),
+        ]
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
     .into()
 }
 
 enum Command {
     Load(Plugin, usize),
     Delete(usize),
+    ParamChange(usize, usize, f32),
     VolumeChange(f32),
 }
 
@@ -138,8 +187,8 @@ struct PluginProcessor {
     left_out: jack::Port<AudioOut>,
     right_out: jack::Port<AudioOut>,
     command_receiver: HeapCons<Command>,
-    // The plugin, is it marked for delete, and its id
-    plugins: Vec<(Plugin, bool, usize)>,
+    // The plugin, its id, and whether is it marked for delete
+    plugins: Vec<(Plugin, usize, bool)>,
     l_vec: Vec<f32>,
     r_vec: Vec<f32>,
     volume: f32,
@@ -148,21 +197,31 @@ struct PluginProcessor {
 impl ProcessHandler for PluginProcessor {
     fn process(&mut self, _: &jack::Client, scope: &jack::ProcessScope) -> jack::Control {
         match self.command_receiver.try_pop() {
-            Some(Command::VolumeChange(volume)) => {
-                self.volume = volume;
-            }
             Some(Command::Load(plugin, id)) => {
-                self.plugins.push((plugin, false, id));
+                self.plugins.push((plugin, id, false));
             }
             Some(Command::Delete(id)) => {
                 // self.plugins.remove(index);
-                // Remove the plugin directly will panic
+                // Remove the plugin directly will cause panic
                 // so mark the plugin for delete
                 for index in 0..self.plugins.len() {
-                    if self.plugins[index].2 == id {
-                        self.plugins[index].1 = true;
+                    if self.plugins[index].1 == id {
+                        self.plugins[index].2 = true;
                     }
                 }
+            }
+            Some(Command::ParamChange(plugin_id, param_index, value)) => {
+                for plugin in &mut self.plugins {
+                    if plugin.1 == plugin_id {
+                        plugin
+                            .0
+                            .set_parameter(param_index, value)
+                            .expect("Failed to set parameter");
+                    }
+                }
+            }
+            Some(Command::VolumeChange(volume)) => {
+                self.volume = volume;
             }
             None => (),
         }
@@ -179,7 +238,7 @@ impl ProcessHandler for PluginProcessor {
 
         for plugin in &mut self.plugins {
             // Only process plugins not marked for delete
-            if plugin.1 == false {
+            if plugin.2 == false {
                 plugin
                     .0
                     .process(
@@ -249,7 +308,14 @@ fn boot() -> AppState {
         .as_client()
         .connect_ports_by_name(&format!("rake:out_right"), &output_ports[1]);
 
+    let plugin_scanner = Some(Scanner::new().expect("Failed to create scanner"));
     AppState {
+        scanned_plugins: plugin_scanner
+            .as_ref()
+            .unwrap()
+            .scan()
+            .expect("Failed to scan plugins"),
+        plugin_scanner,
         command_sender: Some(prod),
         _jack_client: Some(activate_client),
         ..AppState::default()
