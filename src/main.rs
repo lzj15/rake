@@ -2,14 +2,17 @@ use iced::widget::{Column, Row, button, column, row, scrollable, slider, text};
 use iced::{Element, Length};
 use jack::{AudioIn, AudioOut, Client, ClientOptions, ProcessHandler};
 use rack::prelude::*;
+use rfd::FileDialog;
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 fn main() -> iced::Result {
     iced::application(boot, update, view).run()
 }
 
+#[derive(Serialize, Deserialize)]
 struct LoadedPlugin {
     id: Uuid,
     info: PluginInfo,
@@ -35,6 +38,8 @@ enum Message {
     MovePluginDown(Uuid),
     ParamChange(Uuid, usize, f32),
     VolumeChange(f32),
+    SaveState,
+    LoadState,
 }
 
 fn update(state: &mut AppState, message: Message) {
@@ -69,23 +74,22 @@ fn update(state: &mut AppState, message: Message) {
                         ));
                     }
 
-                    let uuid = Uuid::new_v4();
                     let plugin = LoadedPlugin {
-                        id: uuid,
+                        id: Uuid::new_v4(),
                         info: info.clone(),
                         params,
                     };
-                    state.added_plugins.push(plugin);
 
                     if state
                         .command_sender
                         .as_mut()
                         .unwrap()
-                        .try_push(Command::LoadPlugin(plugin_instance, uuid))
+                        .try_push(Command::LoadPlugin(plugin_instance, plugin.id))
                         .is_err()
                     {
                         eprintln!("Failed to send command");
                     }
+                    state.added_plugins.push(plugin);
                 }
             }
         }
@@ -140,7 +144,7 @@ fn update(state: &mut AppState, message: Message) {
         Message::ParamChange(plugin_id, param_index, value) => {
             for plugin in &mut state.added_plugins {
                 if plugin.id == plugin_id {
-                    plugin.params[param_index].1 = value
+                    plugin.params[param_index].1 = value;
                 }
             }
             if state
@@ -165,11 +169,78 @@ fn update(state: &mut AppState, message: Message) {
                 eprintln!("Failed to send command");
             }
         }
+        Message::SaveState => {
+            if let Some(path) = FileDialog::new()
+                .add_filter("YAML", &["yaml"])
+                .set_file_name(".yaml")
+                .save_file()
+            {
+                let content = serde_yaml_ng::to_string(&state.added_plugins).unwrap();
+                std::fs::write(path, content).expect("Failed to write file");
+            }
+        }
+        Message::LoadState => {
+            if let Some(path) = FileDialog::new().add_filter("YAML", &["yaml"]).pick_file() {
+                let content = std::fs::read_to_string(path).unwrap();
+                let mut added_plugins = serde_yaml_ng::from_str::<Vec<LoadedPlugin>>(&content)
+                    .expect("Failed to read yaml");
+
+                for plugin in &mut added_plugins {
+                    plugin.id = Uuid::new_v4();
+                }
+                state.added_plugins = added_plugins;
+
+                if state
+                    .command_sender
+                    .as_mut()
+                    .unwrap()
+                    .try_push(Command::ClearEnabledPlugins)
+                    .is_err()
+                {
+                    eprintln!("Failed to send command");
+                }
+
+                for plugin in &state.added_plugins {
+                    let mut plugin_instance = state
+                        .plugin_scanner
+                        .as_ref()
+                        .unwrap()
+                        .load(&plugin.info)
+                        .expect("Failed to load plugin");
+
+                    plugin_instance
+                        .initialize(48000.0, 2048)
+                        .expect("Failed to initialize plugin");
+
+                    if state
+                        .command_sender
+                        .as_mut()
+                        .unwrap()
+                        .try_push(Command::LoadPlugin(plugin_instance, plugin.id))
+                        .is_err()
+                    {
+                        eprintln!("Failed to send command");
+                    }
+
+                    for param in &plugin.params {
+                        if state
+                            .command_sender
+                            .as_mut()
+                            .unwrap()
+                            .try_push(Command::ParamChange(plugin.id, param.0.index, param.1))
+                            .is_err()
+                        {
+                            eprintln!("Failed to send command");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 fn view(state: &AppState) -> Element<'_, Message> {
-    let mut scanned_plugins_list: Column<'_, Message> = Column::new();
+    let mut scanned_plugins_list = Column::new();
     for info in &state.scanned_plugins {
         scanned_plugins_list = scanned_plugins_list.push(row![
             button("Load").on_press(Message::AddPlugin(info.unique_id.clone())),
@@ -177,31 +248,30 @@ fn view(state: &AppState) -> Element<'_, Message> {
         ]);
     }
 
-    let mut plugin_list: Column<'_, Message> = Column::new();
+    let mut plugin_list = Column::new();
     for (index, plugin) in state.added_plugins.iter().enumerate() {
-        plugin_list = plugin_list.push(text(plugin.info.name.clone()));
-
         for param in &plugin.params {
             plugin_list = plugin_list.push(row![
                 text(param.0.name.clone()).width(Length::Fixed(100.0)),
                 text(format!("{:.2} ", param.1)),
-                slider(0.0..=1.0, param.1, |value| {
+                slider(0.0..=1.0, param.1, move |value| {
                     Message::ParamChange(plugin.id, param.0.index, value)
                 })
                 .step(0.01),
             ]);
         }
 
-        let mut move_control: Row<'_, Message> = Row::new();
+        let mut move_controls = Row::new();
         if index != 0 {
-            move_control =
-                move_control.push(button("Up").on_press(Message::MovePluginUp(plugin.id)));
+            move_controls =
+                move_controls.push(button("Up").on_press(Message::MovePluginUp(plugin.id)));
         }
         if index != state.added_plugins.len() - 1 {
-            move_control =
-                move_control.push(button("Down").on_press(Message::MovePluginDown(plugin.id)));
+            move_controls =
+                move_controls.push(button("Down").on_press(Message::MovePluginDown(plugin.id)));
         }
-        plugin_list = plugin_list.push(move_control);
+
+        plugin_list = plugin_list.push(move_controls);
         plugin_list = plugin_list.push(button("Delete").on_press(Message::DeletePlugin(plugin.id)));
     }
 
@@ -210,8 +280,12 @@ fn view(state: &AppState) -> Element<'_, Message> {
         scanned_plugins_list,
         plugin_list,
         row![
-            text(format!("Volume: {:?} ", state.volume)),
-            slider(0.0..=15.0, state.volume, Message::VolumeChange),
+            button("Save").on_press(Message::SaveState),
+            button("Open").on_press(Message::LoadState)
+        ],
+        row![
+            text(format!("Volume: {:.2} ", state.volume)),
+            slider(0.0..=10.0, state.volume, Message::VolumeChange).step(0.01),
         ]
     ])
     .width(Length::Fill)
@@ -226,6 +300,7 @@ enum Command {
     MovePluginDown(Uuid),
     ParamChange(Uuid, usize, f32),
     VolumeChange(f32),
+    ClearEnabledPlugins,
 }
 
 struct PluginProcessor {
@@ -278,6 +353,9 @@ impl ProcessHandler for PluginProcessor {
                 Command::VolumeChange(volume) => {
                     self.volume = volume;
                 }
+                Command::ClearEnabledPlugins => {
+                    self.enabled_plugins.clear();
+                }
             }
         }
 
@@ -292,7 +370,11 @@ impl ProcessHandler for PluginProcessor {
         self.r_vec.copy_from_slice(r_in);
 
         for id in &self.enabled_plugins {
-            if let Some(plugin) = self.plugin_instances.iter_mut().find(|p| p.1 == *id) {
+            if let Some(plugin) = self
+                .plugin_instances
+                .iter_mut()
+                .find(|plugin| plugin.1 == *id)
+            {
                 let _ = plugin.0.process(
                     &[self.l_vec.as_mut_slice(), self.r_vec.as_mut_slice()],
                     &mut [l_out, r_out],
@@ -338,15 +420,25 @@ fn boot() -> AppState {
     };
 
     let activate_client = client.activate_async((), plugin_processor).unwrap();
+    let input_ports = activate_client
+        .as_client()
+        .ports(None, None, jack::PortFlags::IS_OUTPUT);
+    let output_ports = activate_client
+        .as_client()
+        .ports(None, None, jack::PortFlags::IS_INPUT);
+
     let _ = activate_client
         .as_client()
-        .connect_ports_by_name("system:capture_1", "rake:in_left");
+        .connect_ports_by_name(&input_ports[0], &format!("rake:in_left"));
     let _ = activate_client
         .as_client()
-        .connect_ports_by_name("rake:out_left", "system:playback_1");
+        .connect_ports_by_name(&input_ports[0], &format!("rake:in_right"));
     let _ = activate_client
         .as_client()
-        .connect_ports_by_name("rake:out_right", "system:playback_2");
+        .connect_ports_by_name(&format!("rake:out_left"), &output_ports[0]);
+    let _ = activate_client
+        .as_client()
+        .connect_ports_by_name(&format!("rake:out_right"), &output_ports[1]);
 
     let plugin_scanner = Some(Scanner::new().expect("Failed to create scanner"));
     AppState {
