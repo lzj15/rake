@@ -7,5 +7,8 @@ edition = "2024"
 iced = "0.14.0"
 jack = "0.13.3"
 rack = { git = "https://github.com/lzj15/rack.git" }
+rfd = "0.16.0"
 ringbuf = "0.4.8"
+serde = "1.0.228"
+serde_yaml_ng = "0.10.0"
 uuid = { version = "1.19.0", features = ["v4"] }
