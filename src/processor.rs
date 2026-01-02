@@ -10,7 +10,7 @@ pub enum Command {
     MovePluginUp(Uuid),
     MovePluginDown(Uuid),
     ParamChange(Uuid, ParameterInfo, f32),
-    ClearPlugins,
+    ClearSession,
     VolumeChange(f32),
     Exit,
 }
@@ -75,7 +75,7 @@ impl ProcessHandler for Processor {
                     }
                 }
             }
-            Some(Command::ClearPlugins) => {
+            Some(Command::ClearSession) => {
                 for i in (0..self.loaded_plugins.len()).rev() {
                     if let Err(e) = self.garbage_sender.try_push(self.loaded_plugins.remove(i)) {
                         eprintln!("Error removing plugin {}", e.0.info())
@@ -134,8 +134,8 @@ pub fn initialize() -> (
     HeapProd<Command>,
     HeapCons<(Plugin, Uuid)>,
 ) {
-    let (client, _status) = Client::new("rake", ClientOptions::NO_START_SERVER).unwrap();
-    let (command_sender, command_receiver) = HeapRb::<Command>::new(256).split();
+    let (client, _status) = Client::new("Rake", ClientOptions::NO_START_SERVER).unwrap();
+    let (command_sender, command_receiver) = HeapRb::<Command>::new(512).split();
     let (garbage_sender, garbage_receiver) = HeapRb::<(Plugin, Uuid)>::new(128).split();
 
     let plugin_processor = Processor {
@@ -168,16 +168,16 @@ pub fn initialize() -> (
 
     let _ = active_client
         .as_client()
-        .connect_ports_by_name(&input_ports[0], &format!("rake:in_left"));
+        .connect_ports_by_name(&input_ports[0], &format!("Rake:in_left"));
     let _ = active_client
         .as_client()
-        .connect_ports_by_name(&input_ports[0], &format!("rake:in_right"));
+        .connect_ports_by_name(&input_ports[0], &format!("Rake:in_right"));
     let _ = active_client
         .as_client()
-        .connect_ports_by_name(&format!("rake:out_left"), &output_ports[0]);
+        .connect_ports_by_name(&format!("Rake:out_left"), &output_ports[0]);
     let _ = active_client
         .as_client()
-        .connect_ports_by_name(&format!("rake:out_right"), &output_ports[1]);
+        .connect_ports_by_name(&format!("Rake:out_right"), &output_ports[1]);
 
     (active_client, command_sender, garbage_receiver)
 }

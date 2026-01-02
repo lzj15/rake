@@ -1,19 +1,20 @@
-use iced::widget::{Column, Row, button, column, row, scrollable, slider, text};
-use iced::{Element, Length, Subscription, Task, window};
+use iced::{Subscription, Task, window};
 use rack::prelude::*;
 use rfd::FileDialog;
-use ringbuf::traits::Producer;
-use ringbuf::{HeapCons, HeapProd};
+use ringbuf::{HeapCons, HeapProd, traits::Producer};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 mod processor;
+mod view;
 use processor::*;
 
 fn main() -> iced::Result {
-    iced::application(boot, update, view)
+    iced::application(boot, update, view::view)
         .exit_on_close_request(false)
         .subscription(subscription)
+        .theme(iced::Theme::CatppuccinLatte)
         .run()
 }
 
@@ -36,7 +37,8 @@ struct AppState {
     volume: f32,
     command_sender: Option<HeapProd<Command>>,
     _garbage_receiver: Option<HeapCons<(Plugin, Uuid)>>,
-    _jack_client: Option<jack::AsyncClient<(), processor::Processor>>,
+    session_path: PathBuf,
+    jack_client: Option<jack::AsyncClient<(), processor::Processor>>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,20 +49,21 @@ enum Message {
     MovePluginUp(Uuid),
     MovePluginDown(Uuid),
     ParamChange(Uuid, ParameterInfo, f32),
-    ClearPlugins,
-    SaveState,
-    LoadState,
+    ClearSession,
+    SaveSession,
+    LoadSession,
     VolumeChange(f32),
     Exit,
 }
 
-fn create_instance(scanner: &Scanner, info: &PluginInfo) -> Result<Plugin> {
+fn create_instance(scanner: &Scanner, info: &PluginInfo, client: &jack::Client) -> Result<Plugin> {
     let mut plugin_instance = scanner.load(info)?;
-    let _ = plugin_instance.initialize(48000.0, 2048)?;
+    let _ =
+        plugin_instance.initialize(client.sample_rate() as f64, client.buffer_size() as usize)?;
     Ok(plugin_instance)
 }
 
-fn load_state(state: &mut AppState, path: &std::path::PathBuf) -> Result<Vec<LoadedPlugin>> {
+fn load_session(state: &mut AppState, path: &std::path::PathBuf) -> Result<Vec<LoadedPlugin>> {
     let content = std::fs::read_to_string(path)?;
     let mut saved_plugins = serde_yaml_ng::from_str::<Vec<LoadedPlugin>>(&content)
         .map_err(|e| rack::Error::Other(format!("Incorrect YAML: {}", e)))?;
@@ -73,12 +76,15 @@ fn load_state(state: &mut AppState, path: &std::path::PathBuf) -> Result<Vec<Loa
         .command_sender
         .as_mut()
         .unwrap()
-        .try_push(Command::ClearPlugins)
-        .map_err(|_| rack::Error::Other("Error sending command to clear plugins".to_string()))?;
+        .try_push(Command::ClearSession)
+        .map_err(|_| rack::Error::Other("Error sending command to clear session".to_string()))?;
 
     for plugin in &saved_plugins {
-        let plugin_instance =
-            create_instance(state.plugin_scanner.as_ref().unwrap(), &plugin.info)?;
+        let plugin_instance = create_instance(
+            state.plugin_scanner.as_ref().unwrap(),
+            &plugin.info,
+            state.jack_client.as_ref().unwrap().as_client(),
+        )?;
 
         let _ = state
             .command_sender
@@ -118,9 +124,11 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::LoadPlugin(info) => {
-            if let Ok(plugin_instance) =
-                create_instance(state.plugin_scanner.as_ref().unwrap(), &info)
-            {
+            if let Ok(plugin_instance) = create_instance(
+                state.plugin_scanner.as_ref().unwrap(),
+                &info,
+                state.jack_client.as_ref().unwrap().as_client(),
+            ) {
                 let mut params = Vec::with_capacity(plugin_instance.parameter_count());
                 for i in 0..plugin_instance.parameter_count() {
                     params.push((
@@ -166,7 +174,7 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
                     eprintln!("Error sending command to delete plugin");
                 }
             }
-            //TODO: Safely drop plugin instances
+            // TODO: Safely drop plugin instances
             // if let Some(_plugin) = state.garbage_receiver.as_mut().unwrap().try_pop() {
             // }
             Task::none()
@@ -237,40 +245,51 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::ClearPlugins => {
+        Message::ClearSession => {
             match state
                 .command_sender
                 .as_mut()
                 .unwrap()
-                .try_push(Command::ClearPlugins)
+                .try_push(Command::ClearSession)
             {
                 Ok(_) => {
                     state.loaded_plugins.clear();
                 }
                 Err(_) => {
-                    eprintln!("Error sending command to clear plugins");
+                    eprintln!("Error sending command to clear session");
                 }
             }
             Task::none()
         }
-        Message::SaveState => {
+        Message::SaveSession => {
+            let content = serde_yaml_ng::to_string(&state.loaded_plugins).unwrap();
+            if state.session_path.exists() {
+                if let Err(e) = std::fs::write(&state.session_path, content) {
+                    eprintln!("Error writing {}: {}", state.session_path.display(), e);
+                }
+            } else {
+                if let Some(path) = FileDialog::new()
+                    .add_filter("YAML", &["yaml"])
+                    .set_file_name(".yaml")
+                    .save_file()
+                {
+                    if let Err(e) = std::fs::write(&path, content) {
+                        eprintln!("Error writing {}: {}", path.display(), e);
+                    }
+                }
+            }
+            Task::none()
+        }
+        Message::LoadSession => {
             if let Some(path) = FileDialog::new()
+                .set_directory(state.session_path.parent().unwrap_or_else(|| Path::new("")))
                 .add_filter("YAML", &["yaml"])
-                .set_file_name(".yaml")
-                .save_file()
+                .pick_file()
             {
-                let content = serde_yaml_ng::to_string(&state.loaded_plugins).unwrap();
-                if let Err(e) = std::fs::write(path.clone(), content) {
-                    eprintln!("Error writing {}: {}", path.display(), e);
-                }
-            }
-            Task::none()
-        }
-        Message::LoadState => {
-            if let Some(path) = FileDialog::new().add_filter("YAML", &["yaml"]).pick_file() {
-                match load_state(state, &path) {
+                match load_session(state, &path) {
                     Ok(plugins) => {
                         state.loaded_plugins = plugins;
+                        state.session_path = path;
                     }
                     Err(e) => {
                         eprintln!("Error loading {}: {}", path.display(), e)
@@ -306,68 +325,6 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
     }
 }
 
-fn view(state: &AppState) -> Element<'_, Message> {
-    let mut scanned_plugin_list = Column::new();
-    for info in &state.scanned_plugins {
-        scanned_plugin_list = scanned_plugin_list.push(row![
-            button("Load").on_press(Message::LoadPlugin(info.clone())),
-            text(format!(" {}", info))
-        ]);
-    }
-
-    let mut plugin_list = Column::new();
-    for (index, plugin) in state.loaded_plugins.iter().enumerate() {
-        plugin_list = plugin_list.push(text(plugin.info.name.clone()));
-
-        for param in &plugin.params {
-            plugin_list = plugin_list.push(row![
-                text(param.0.name.clone()).width(Length::Fixed(100.0)),
-                text(format!("{:.2} ", param.1)),
-                slider(0.0..=1.0, param.1, |value| {
-                    // TODO: denormalize parameter value
-                    // For VST3, it seems that min/max in ParameterInfo always gives 0.0 and 1.0
-                    // so currently there's no way to denormalize parameter value
-                    Message::ParamChange(plugin.id, param.0.clone(), value)
-                })
-                .step(0.01),
-            ]);
-        }
-
-        let mut order_controls = Row::new();
-        if index != 0 {
-            order_controls =
-                order_controls.push(button("Up").on_press(Message::MovePluginUp(plugin.id)));
-        }
-        if index != state.loaded_plugins.len() - 1 {
-            order_controls =
-                order_controls.push(button("Down").on_press(Message::MovePluginDown(plugin.id)));
-        }
-
-        plugin_list = plugin_list.push(order_controls);
-        plugin_list = plugin_list.push(button("Delete").on_press(Message::DeletePlugin(plugin.id)));
-    }
-
-    column![
-        row![
-            button("Open").on_press(Message::LoadState),
-            button("Save").on_press(Message::SaveState),
-            button("Clear").on_press(Message::ClearPlugins),
-            button("Rescan").on_press(Message::Scan),
-        ],
-        text(format!("Found plugins:")),
-        scrollable(scanned_plugin_list).height(Length::FillPortion(1)),
-        text(format!("Loaded plugins:")),
-        scrollable(plugin_list).height(Length::FillPortion(6)),
-        row![
-            text(format!("Volume: {:.2} ", state.volume)),
-            slider(0.0..=10.0, state.volume, Message::VolumeChange).step(0.01),
-        ],
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
-}
-
 fn boot() -> AppState {
     let (active_client, command_sender, garbage_receiver) = processor::initialize();
     let plugin_scanner = Some(Scanner::new().expect("Error creating plugin scanner"));
@@ -380,7 +337,7 @@ fn boot() -> AppState {
         volume: 1.0,
         command_sender: Some(command_sender),
         _garbage_receiver: Some(garbage_receiver),
-        _jack_client: Some(active_client),
+        jack_client: Some(active_client),
         ..AppState::default()
     }
 }
